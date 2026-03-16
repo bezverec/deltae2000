@@ -36,7 +36,7 @@ The current version supports:
 - `.xlsm`
 - `.xltx`
 - `.xltm`
-- `.xls` fileciteturn12file1
+- `.xls`
 
 ### Supported TXT variants
 
