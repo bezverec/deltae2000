@@ -22,7 +22,7 @@ The current script version:
 - computes **ΔL\***, **Δa\***, and **Δb\*** for each patch,
 - derives a **neutral scale subset** from reference chroma,
 - creates plots, CSV/JSON outputs, and a bilingual HTML report,
-- optionally evaluates the result against **Metamorfoze** thresholds. fileciteturn12file1
+- optionally evaluates the result against **Metamorfoze** thresholds.
 
 ---
 
@@ -52,7 +52,7 @@ The TXT parser supports both:
    - `BEGIN_DATA_FORMAT`
    - `BEGIN_DATA`
    - patch/sample column names such as `Sample_NAME`, `SAMPLE_NAME`, `SampleID`, `patch`, or `name`
-   - LAB columns such as `LAB_L`, `LAB_A`, `LAB_B`. fileciteturn12file1turn12file7
+   - LAB columns such as `LAB_L`, `LAB_A`, `LAB_B`.
 
 ### Supported table structures
 
@@ -80,7 +80,7 @@ The loader:
 
 - normalizes decimal commas,
 - recognizes columns such as `L*`, `a*`, `b*`, `LAB_L`, `LAB_A`, `LAB_B`,
-- derives `row` and `col` from patch names like `A1`, `B10`, `N10`. fileciteturn12file1
+- derives `row` and `col` from patch names like `A1`, `B10`, `N10`.
 
 ---
 
@@ -105,7 +105,7 @@ Default grid:
 This corresponds to:
 
 - columns: **A–N**
-- rows: **1–10**. fileciteturn12file1
+- rows: **1–10**.
 
 ---
 
@@ -122,7 +122,7 @@ Behavior:
 --icc profile.icc
 ```
 
-If neither an embedded profile nor `--icc` is available, the script stops with an error. fileciteturn12file1
+If neither an embedded profile nor `--icc` is available, the script stops with an error.
 
 ---
 
@@ -170,7 +170,7 @@ If neither an embedded profile nor `--icc` is available, the script stops with a
 - `--run-tests` — runs built-in self-tests and exits
 - `--skip-colourspace-plot` — skips the chromaticity plot
 - `--skip-rgb-bars-plot` — skips the measured RGB bar chart
-- `--skip-html-report` — skips HTML report generation. fileciteturn12file1
+- `--skip-html-report` — skips HTML report generation.
 
 ---
 
@@ -234,7 +234,7 @@ The current implementation supports these threshold sets:
 
 ### Extra-light / none
 
-These modes do not currently apply a numerical pass/fail decision in the script. fileciteturn12file1
+These modes do not currently apply a numerical pass/fail decision in the script.
 
 ---
 
@@ -254,13 +254,13 @@ The current version writes the following outputs into the directory specified by
 - `lstar_scatter.png` — reference vs measured L\* scatter plot
 - `neutral_scale_plot.png` — neutral-scale plot
 - `colourspace_chromaticity.png` — chromaticity plot against **sRGB**, **ECI RGB v2**, and **Adobe RGB (1998)**
-- `measured_rgb_bars.png` — grouped 2D bar chart of measured RGB values. fileciteturn12file1turn12file5
+- `measured_rgb_bars.png` — grouped 2D bar chart of measured RGB values.
 
 ### Data outputs
 
 - `measurements.csv` — detailed per-patch numeric output
 - `summary.json` — summary statistics, generated plot list, Metamorfoze status, neutral-scale summary, and worst patches
-- `report.html` — bilingual HTML report with CZE/ENG language switch. fileciteturn12file1turn12file9
+- `report.html` — bilingual HTML report with CZE/ENG language switch.
 
 ---
 
@@ -284,7 +284,7 @@ The report includes:
   - measured Lab
   - measured RGB
   - ΔE00
-- a language switch between **CZE** and **ENG**. fileciteturn12file1turn12file4
+- a language switch between **CZE** and **ENG**.
 
 ---
 
@@ -302,7 +302,7 @@ The neutral summary includes:
 - mean / max ΔE00
 - mean / max absolute ΔL\*
 - mean / max absolute Δa\*
-- mean / max absolute Δb\*. fileciteturn12file1
+- mean / max absolute Δb\*.
 
 ---
 
@@ -315,7 +315,7 @@ For LAB images returned by ImageCms:
 - `L` is stored as unsigned 8-bit and must be rescaled from `0..255` to `0..100`
 - `a` and `b` must be interpreted as **signed int8** values
 
-Treating `a` and `b` incorrectly as unsigned values produces invalid Lab data and unrealistically high ΔE values. fileciteturn12file1
+Treating `a` and `b` incorrectly as unsigned values produces invalid Lab data and unrealistically high ΔE values.
 
 ---
 
@@ -337,7 +337,7 @@ The current tests cover:
 - CSV reference loading
 - simple TXT reference loading
 - minimal CGATS TXT loading
-- extended CGATS TXT loading. fileciteturn12file7
+- extended CGATS TXT loading.
 
 ---
 
@@ -353,7 +353,7 @@ The current tests cover:
   - chart orientation,
   - grid dimensions,
   - `--patch-fill`,
-  - the neutral chroma threshold if you rely on the neutral subset. fileciteturn12file1
+  - the neutral chroma threshold if you rely on the neutral subset.
 
 ---
 
@@ -362,7 +362,7 @@ The current tests cover:
 - Corner selection is still manual unless `--corners` is provided.
 - The chart is modeled as a regular grid.
 - No automatic target detection is implemented.
-- The script is optimized for CCSG naming and default geometry. fileciteturn12file1
+- The script is optimized for CCSG naming and default geometry.
 
 ---
 
