@@ -1,0 +1,8 @@
+numpy
+pandas
+Pillow
+opencv-python
+matplotlib
+colour-science
+openpyxl
+xlrd
