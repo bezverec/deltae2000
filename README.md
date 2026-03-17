@@ -1,6 +1,6 @@
 # DeltaE2000
 
-Semi-automatic evaluation tool for *ColorChecker SG** using the **CIEDE2000 (ΔE00)** metric.
+Semi-automatic evaluation tool for **ColorChecker SG** using the **CIEDE2000 (ΔE00)** metric.
 
 This script is designed for digitization and QA workflows where a chart image must be compared against target-specific reference values in **CIE Lab**.
 
