@@ -378,3 +378,9 @@ The current tests cover:
 - Metamorfoze threshold checking,
 - chromaticity and RGB visualizations,
 - CSV/JSON/HTML reporting.
+
+---
+
+## AI generated code disclosure
+
+The code is generated using ChatGPT 5.4.
