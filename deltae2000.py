@@ -35,7 +35,8 @@ except Exception as exc:  # pragma: no cover
 
 
 APP_TITLE = "DeltaE2000 v0.0.1"
-SCRIPT_VERSION = "2026-03-16-deltae2000-v0.0.1"
+SCRIPT_VERSION = "2026-03-18-deltae2000-v0.0.2"
+
 
 @dataclass
 class PatchReference:
@@ -78,7 +79,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  python deltae2000.py --image sample.tif --reference ref.csv --output-dir out --icc eciRGB_v2.icc\n"
             "  python deltae2000.py --image sample.tif --reference ref.txt --output-dir out\n"
-            "  python deltae2000.py --image sample.tif --reference ref.csv --output-dir out --corners 10 10 200 10 200 150 10 150 --no-gui"
+            "  python deltae2000.py --image sample.tif --reference ref.csv --output-dir out --corners 10 10 200 10 200 150 10 150 --no-gui\n"
+            "  python deltae2000.py --image sample.tif --reference ref.txt --output-dir out --deltae-method metamorfoze-sl1"
         ),
     )
     parser.add_argument("--image", help="Input image path")
@@ -121,6 +123,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=5.0,
         help="Reference chroma threshold for neutral-scale detection from reference Lab values",
+    )
+    parser.add_argument(
+        "--deltae-method",
+        choices=["cie2000", "metamorfoze-sl1"],
+        default="cie2000",
+        help="Delta E method: standard CIEDE2000 or Metamorfoze variant with S_L=1",
     )
     parser.add_argument(
         "--metamorfoze-level",
@@ -281,7 +289,8 @@ def load_reference_txt(path: str) -> pd.DataFrame:
         format_tokens = re.split(r"\s+", " ".join(format_lines).strip())
         normalized_tokens = [normalize_name(token) for token in format_tokens]
 
-        sample_candidates = {"sample_name", "sampleid", "sample_id", "patch", "name"}
+        sample_name_candidates = {"sample_name", "patch", "name"}
+        sample_id_candidates = {"sampleid", "sample_id"}
         l_candidates = {"lab_l", "l", "lstar"}
         a_candidates = {"lab_a", "a", "astar"}
         b_candidates = {"lab_b", "b", "bstar"}
@@ -292,7 +301,9 @@ def load_reference_txt(path: str) -> pd.DataFrame:
                     return i
             return None
 
-        patch_idx = find_index(sample_candidates)
+        patch_idx = find_index(sample_name_candidates)
+        if patch_idx is None:
+            patch_idx = find_index(sample_id_candidates)
         l_idx = find_index(l_candidates)
         a_idx = find_index(a_candidates)
         b_idx = find_index(b_candidates)
@@ -371,8 +382,7 @@ def load_reference_txt(path: str) -> pd.DataFrame:
         "(1) simple Patch/LAB_L/LAB_A/LAB_B table, "
         "(2) CGATS-like BEGIN_DATA_FORMAT / BEGIN_DATA with patch/sample and LAB columns."
     )
-
-
+    
 def normalize_reference_columns(df: pd.DataFrame, source_label: str) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(col).strip() for col in df.columns]
@@ -439,6 +449,7 @@ def normalize_reference_columns(df: pd.DataFrame, source_label: str) -> pd.DataF
         df["col"] = parsed_positions.apply(lambda rc: rc[1])
 
     return df[["patch", "L", "a", "b", "row", "col"]]
+
 
 def dataframe_to_references(df: pd.DataFrame) -> List[PatchReference]:
     refs: List[PatchReference] = []
@@ -730,6 +741,111 @@ def image_file_to_data_uri(path: str) -> str:
     with open(path, "rb") as f:
         encoded = base64.b64encode(f.read()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+    
+def delta_e_2000_sl1(
+    lab1: Tuple[float, float, float],
+    lab2: Tuple[float, float, float],
+    kC: float = 1.0,
+    kH: float = 1.0,
+) -> float:
+    """
+    CIEDE2000 variant with S_L forced to 1, as required by Metamorfoze.
+    """
+
+    L1, a1, b1 = [float(v) for v in lab1]
+    L2, a2, b2 = [float(v) for v in lab2]
+
+    C1 = np.hypot(a1, b1)
+    C2 = np.hypot(a2, b2)
+    C_bar = 0.5 * (C1 + C2)
+
+    C_bar7 = C_bar ** 7
+    G = 0.5 * (1.0 - np.sqrt(C_bar7 / (C_bar7 + 25.0 ** 7))) if C_bar > 0 else 0.0
+
+    a1p = (1.0 + G) * a1
+    a2p = (1.0 + G) * a2
+
+    C1p = np.hypot(a1p, b1)
+    C2p = np.hypot(a2p, b2)
+
+    def hp_fun(a_prime: float, b_val: float) -> float:
+        if a_prime == 0.0 and b_val == 0.0:
+            return 0.0
+        angle = np.degrees(np.arctan2(b_val, a_prime))
+        return angle + 360.0 if angle < 0 else angle
+
+    h1p = hp_fun(a1p, b1)
+    h2p = hp_fun(a2p, b2)
+
+    dLp = L2 - L1
+    dCp = C2p - C1p
+
+    if C1p * C2p == 0:
+        dhp = 0.0
+    else:
+        dhp = h2p - h1p
+        if dhp > 180.0:
+            dhp -= 360.0
+        elif dhp < -180.0:
+            dhp += 360.0
+
+    dHp = 2.0 * np.sqrt(C1p * C2p) * np.sin(np.radians(dhp) / 2.0)
+
+    Cp_bar = 0.5 * (C1p + C2p)
+
+    if C1p * C2p == 0:
+        hp_bar = h1p + h2p
+    else:
+        hsum = h1p + h2p
+        if abs(h1p - h2p) > 180.0:
+            if hsum < 360.0:
+                hp_bar = 0.5 * (hsum + 360.0)
+            else:
+                hp_bar = 0.5 * (hsum - 360.0)
+        else:
+            hp_bar = 0.5 * hsum
+
+    T = (
+        1.0
+        - 0.17 * np.cos(np.radians(hp_bar - 30.0))
+        + 0.24 * np.cos(np.radians(2.0 * hp_bar))
+        + 0.32 * np.cos(np.radians(3.0 * hp_bar + 6.0))
+        - 0.20 * np.cos(np.radians(4.0 * hp_bar - 63.0))
+    )
+
+    delta_theta = 30.0 * np.exp(-((hp_bar - 275.0) / 25.0) ** 2)
+    Rc = 2.0 * np.sqrt((Cp_bar ** 7) / (Cp_bar ** 7 + 25.0 ** 7)) if Cp_bar > 0 else 0.0
+
+    S_L = 1.0
+    S_C = 1.0 + 0.045 * Cp_bar
+    S_H = 1.0 + 0.015 * Cp_bar * T
+    R_T = -np.sin(np.radians(2.0 * delta_theta)) * Rc
+
+    term_L = dLp / S_L
+    term_C = dCp / (kC * S_C)
+    term_H = dHp / (kH * S_H)
+
+    delta_e = np.sqrt(
+        term_L * term_L
+        + term_C * term_C
+        + term_H * term_H
+        + R_T * term_C * term_H
+    )
+    return float(delta_e)
+
+
+def compute_delta_e(
+    lab_ref: Tuple[float, float, float],
+    lab_meas: Tuple[float, float, float],
+    method: str,
+) -> float:
+    method = str(method).lower()
+    if method == "cie2000":
+        return float(colour.delta_E(np.array(lab_ref), np.array(lab_meas), method="CIE 2000"))
+    if method == "metamorfoze-sl1":
+        return delta_e_2000_sl1(lab_ref, lab_meas)
+    raise ValueError(f"Unsupported deltaE method: {method}")
+
 
 def compute_measurements(
     rectified_bgr: np.ndarray,
@@ -739,6 +855,7 @@ def compute_measurements(
     patch_fill: float,
     rgb_to_lab_transform: ImageCms.ImageCmsTransform,
     neutral_chroma_threshold: float,
+    deltae_method: str,
 ) -> List[PatchMeasurement]:
     results: List[PatchMeasurement] = []
     for ref in references:
@@ -753,7 +870,7 @@ def compute_measurements(
         rgb = sample_roi_rgb_mean(rectified_bgr, roi)
         lab_meas = rgb_triplet_to_lab(rgb, rgb_to_lab_transform)
         lab_ref = (ref.L, ref.a, ref.b)
-        de = float(colour.delta_E(np.array(lab_ref), np.array(lab_meas), method="CIE 2000"))
+        de = compute_delta_e(lab_ref, lab_meas, deltae_method)
         dL = float(lab_meas[0] - lab_ref[0])
         da = float(lab_meas[1] - lab_ref[1])
         db = float(lab_meas[2] - lab_ref[2])
@@ -943,8 +1060,7 @@ def save_delta_component_heatmap(
     getter, title, label = mapping[component_name]
     arr, labels = measurement_grid(measurements, grid_rows, grid_cols, getter)
     save_heatmap_from_values(arr, labels, grid_rows, grid_cols, title, label, output_path, cmap="coolwarm")
-
-
+    
 def get_rgb_colourspace_by_name(name: str):
     aliases = {
         "eciRGBv2": ["ECI RGB v2", "eciRGB v2", "eciRGBv2"],
@@ -1098,6 +1214,7 @@ def save_measured_rgb_bars(measurements: Sequence[PatchMeasurement], output_path
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
 
+
 def write_measurements_csv(measurements: Sequence[PatchMeasurement], output_path: str) -> None:
     rows = []
     for m in measurements:
@@ -1139,12 +1256,14 @@ def write_summary_json(
     metamorfoze_eval: Dict[str, Optional[bool]],
     neutral_summary: Dict[str, object],
     corners_xy: Sequence[Tuple[float, float]],
+    deltae_method: str,
 ) -> None:
     delta_e_values = [m.delta_e_00 for m in measurements]
     summary = {
         "image": str(Path(image_path).resolve()),
         "reference": str(Path(reference_path).resolve()),
         "profile_used": profile_name,
+        "deltae_method": deltae_method,
         "generated_plots": {
             "heatmap": "deltae_heatmap.png",
             "deltaL_heatmap": "deltaL_heatmap.png",
@@ -1185,6 +1304,7 @@ def report_strings() -> Dict[str, Dict[str, str]]:
             "patch_count": "Počet polí",
             "mean_de": "Průměrná ΔE00",
             "max_de": "Maximální ΔE00",
+            "deltae_method": "Metoda ΔE",
             "metamorfoze": "Metamorfoze",
             "plots": "Grafy",
             "legend": "Legenda patchů",
@@ -1221,6 +1341,7 @@ def report_strings() -> Dict[str, Dict[str, str]]:
             "patch_count": "Patch count",
             "mean_de": "Mean ΔE00",
             "max_de": "Max ΔE00",
+            "deltae_method": "ΔE method",
             "metamorfoze": "Metamorfoze",
             "plots": "Plots",
             "legend": "Patch legend",
@@ -1258,6 +1379,7 @@ def write_html_report(
     metamorfoze_eval: Dict[str, Optional[bool]],
     neutral_summary: Dict[str, object],
     plot_paths: Dict[str, str],
+    deltae_method: str,
 ) -> None:
     strings = report_strings()
     s_cz = strings["cze"]
@@ -1431,6 +1553,7 @@ function setLang(lang) {{
     <p><strong class="lang-cze">{html.escape(s_cz["patch_count"])}:</strong><strong class="lang-eng">{html.escape(s_en["patch_count"])}:</strong> {len(measurements)}</p>
     <p><strong class="lang-cze">{html.escape(s_cz["mean_de"])}:</strong><strong class="lang-eng">{html.escape(s_en["mean_de"])}:</strong> {mean_de:.3f}</p>
     <p><strong class="lang-cze">{html.escape(s_cz["max_de"])}:</strong><strong class="lang-eng">{html.escape(s_en["max_de"])}:</strong> {max_de:.3f}</p>
+    <p><strong class="lang-cze">{html.escape(s_cz["deltae_method"])}:</strong><strong class="lang-eng">{html.escape(s_en["deltae_method"])}:</strong> {html.escape(deltae_method)}</p>
   </div>
 
   <div class="card">
@@ -1544,6 +1667,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         patch_fill=args.patch_fill,
         rgb_to_lab_transform=rgb_to_lab_transform,
         neutral_chroma_threshold=args.neutral_chroma_threshold,
+        deltae_method=args.deltae_method,
     )
 
     delta_e_values = np.array([m.delta_e_00 for m in measurements], dtype=float)
@@ -1590,6 +1714,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         metamorfoze_eval,
         neutral_summary,
         corners_xy,
+        args.deltae_method,
     )
 
     plot_paths = {
@@ -1617,11 +1742,13 @@ def run_pipeline(args: argparse.Namespace) -> int:
             metamorfoze_eval,
             neutral_summary,
             plot_paths,
+            args.deltae_method,
         )
 
     print(f"Image:           {args.image}")
     print(f"Reference:       {args.reference}")
     print(f"Profile used:    {profile_name}")
+    print(f"Delta E method:  {args.deltae_method}")
     print(f"Patch count:     {len(measurements)}")
     print(f"Mean ΔE00:       {mean_de:.3f}")
     print(f"Max  ΔE00:       {max_de:.3f}")
@@ -1761,6 +1888,14 @@ def run_self_tests() -> int:
             assert_true(refs[0].patch == "A1", f"Unexpected first extended CGATS txt patch: {refs[0].patch}")
             assert_true(refs[1].row == 9 and refs[1].col == 1, f"Unexpected B10 extended CGATS position: {refs[1].row}, {refs[1].col}")
 
+    def test_delta_e_sl1_differs_from_standard() -> None:
+        lab1 = (50.0, 2.0, 3.0)
+        lab2 = (55.0, 4.0, 1.0)
+        de_std = compute_delta_e(lab1, lab2, "cie2000")
+        de_sl1 = compute_delta_e(lab1, lab2, "metamorfoze-sl1")
+        assert_true(np.isfinite(de_std) and np.isfinite(de_sl1), "Delta E values must be finite")
+        assert_true(abs(de_std - de_sl1) > 1e-9, "SL=1 variant should differ from standard CIEDE2000 for this sample")
+
     tests = [
         test_patch_name_to_row_col,
         test_parse_float_maybe_comma,
@@ -1771,6 +1906,7 @@ def run_self_tests() -> int:
         test_load_reference_txt_simple,
         test_load_reference_txt_cgats_minimal,
         test_load_reference_txt_cgats_extended,
+        test_delta_e_sl1_differs_from_standard,
     ]
 
     failures = []
