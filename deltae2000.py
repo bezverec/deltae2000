@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeltaE2000: semi-automatic ColorChecker Digital SG evaluation script.
-Author: Jan Houserek
+DeltaE2000
+
+What this script evaluates reliably from a single CCSG capture:
+- Color accuracy (CIE2000 SL=1)
+- White balance on neutrals in the image centre (CIE2000 without luminance = ΔE(ab)*)
+- Exposure on neutrals in the image centre (ΔL* using CIE2000SL=1 semantics; numerically abs(L_meas-L_ref))
+- Approximate gain modulation on CCSG neutrals in the image centre
+
+What this script does NOT fully evaluate:
+- White balance across the entire image plane
+- Illumination non-uniformity across the entire image plane
+- File format / metadata compliance
+- MTF / sharpening / geometric distortion / noise across repeated captures
+
+Author: Jan Houserek + revised Metamorfoze logic
 License: GPLv3
 """
 
@@ -13,10 +26,11 @@ import base64
 import html
 import io
 import json
+import math
 import re
 import sys
 import zipfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -34,8 +48,45 @@ except Exception as exc:  # pragma: no cover
     ) from exc
 
 
-APP_TITLE = "DeltaE2000 v0.0.1"
-SCRIPT_VERSION = "2026-03-18-deltae2000-v0.0.2"
+APP_TITLE = "DeltaE2000 v0.0.3"
+SCRIPT_VERSION = "2026-03-19-deltae2000-v0.0.3"
+
+METAMORFOZE_SPECS: Dict[str, Dict[str, object]] = {
+    "full": {
+        "neutral_lstar_floor": 5.0,
+        "white_balance_limit": 3.0,      # ΔE(ab)*
+        "exposure_limit": 2.0,           # ΔL*
+        "gain_highlights_min": 80.0,     # %
+        "gain_highlights_max": 110.0,    # %
+        "gain_other_min": 60.0,          # %
+        "gain_other_max": 140.0,         # %
+        "color_mean_limit": 3.0,         # mean ΔE*
+        "color_max_limit": 7.0,          # max ΔE*
+    },
+    "light": {
+        "neutral_lstar_floor": 20.0,
+        "white_balance_limit": 3.0,
+        "exposure_limit": 2.0,
+        "gain_highlights_min": 80.0,
+        "gain_highlights_max": 110.0,
+        "gain_other_min": 60.0,
+        "gain_other_max": 140.0,
+        "color_mean_limit": 4.0,
+        "color_max_limit": 14.0,
+    },
+    "extra-light": {
+        "neutral_lstar_floor": 30.0,
+        "white_balance_limit": 5.0,
+        "exposure_limit": 4.0,
+        "gain_highlights_min": 80.0,
+        "gain_highlights_max": 110.0,
+        "gain_other_min": 60.0,
+        "gain_other_max": 140.0,
+        "color_mean_limit": None,
+        "color_max_limit": None,
+    },
+    "none": {},
+}
 
 
 @dataclass
@@ -56,13 +107,29 @@ class PatchMeasurement:
     rgb_mean_8bit: Tuple[float, float, float]
     lab_measured: Tuple[float, float, float]
     lab_reference: Tuple[float, float, float]
-    delta_e_00: float
+    delta_e_cie2000: float
+    delta_e_sl1: float
+    delta_e_ab: float
     delta_L: float
     delta_a: float
     delta_b: float
     reference_chroma: float
     is_neutral_reference: bool
     roi_rectified_xywh: Tuple[int, int, int, int]
+
+
+@dataclass
+class GainPair:
+    patch_hi: str
+    patch_lo: str
+    L_ref_hi: float
+    L_ref_lo: float
+    L_meas_hi: float
+    L_meas_lo: float
+    ref_diff: float
+    meas_diff: float
+    gain_percent: float
+    bucket: str  # "highlights" or "other"
 
 
 def stderr_write(text: str) -> None:
@@ -73,20 +140,23 @@ def stderr_write(text: str) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="DeltaE2000: semi-automatic CCSG Delta E evaluator",
+        description="DeltaE2000 / Metamorfoze evaluator for ColorChecker Digital SG",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python deltae2000.py --image sample.tif --reference ref.csv --output-dir out --icc eciRGB_v2.icc\n"
-            "  python deltae2000.py --image sample.tif --reference ref.txt --output-dir out\n"
-            "  python deltae2000.py --image sample.tif --reference ref.csv --output-dir out --corners 10 10 200 10 200 150 10 150 --no-gui\n"
-            "  python deltae2000.py --image sample.tif --reference ref.txt --output-dir out --deltae-method metamorfoze-sl1"
+            "  python deltae_metamorfoze.py --image sample.tif --reference ref.csv --output-dir out --icc eciRGB_v2.icc\n"
+            "  python deltae_metamorfoze.py --image sample.tif --reference ref.txt --output-dir out --metamorfoze-level full\n"
+            "  python deltae_metamorfoze.py --image sample.tif --reference ref.csv --output-dir out --corners 10 10 200 10 200 150 10 150 --no-gui\n"
         ),
     )
     parser.add_argument("--image", help="Input image path")
     parser.add_argument(
         "--reference",
-        help="Reference table (.csv/.txt/.xlsx/.xls) with either columns patch,L,a,b,row,col, TXT variants with Patch/LAB_L/LAB_A/LAB_B or CGATS BEGIN_DATA_FORMAT/BEGIN_DATA blocks, or Excel-style columns patch/L*/a*/b* where row,col are derived from CCSG patch names like A1 (letter=column, number=row)",
+        help=(
+            "Reference table (.csv/.txt/.xlsx/.xls) with either columns patch,L,a,b,row,col, "
+            "TXT variants with Patch/LAB_L/LAB_A/LAB_B or CGATS BEGIN_DATA_FORMAT/BEGIN_DATA blocks, "
+            "or Excel-style columns patch/L*/a*/b* where row,col are derived from CCSG patch names like A1."
+        ),
     )
     parser.add_argument("--output-dir", help="Directory for outputs")
     parser.add_argument(
@@ -98,13 +168,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--grid-cols",
         type=int,
         default=14,
-        help="Number of patch columns in the rectified chart grid (CCSG default: 14 columns)",
+        help="Number of patch columns in the rectified chart grid (CCSG default: 14)",
     )
     parser.add_argument(
         "--grid-rows",
         type=int,
         default=10,
-        help="Number of patch rows in the rectified chart grid (CCSG default: 10 rows)",
+        help="Number of patch rows in the rectified chart grid (CCSG default: 10)",
     )
     parser.add_argument(
         "--rectified-width",
@@ -125,16 +195,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Reference chroma threshold for neutral-scale detection from reference Lab values",
     )
     parser.add_argument(
-        "--deltae-method",
-        choices=["cie2000", "metamorfoze-sl1"],
-        default="cie2000",
-        help="Delta E method: standard CIEDE2000 or Metamorfoze variant with S_L=1",
-    )
-    parser.add_argument(
         "--metamorfoze-level",
         choices=["full", "light", "extra-light", "none"],
         default="none",
-        help="Optional PASS/FAIL evaluation thresholds",
+        help="Optional Metamorfoze evaluation thresholds",
     )
     parser.add_argument(
         "--no-gui",
@@ -246,7 +310,6 @@ def parse_float_maybe_comma(value: object) -> float:
     if not text:
         raise ValueError("Unexpected empty numeric value in reference table")
     return float(text.replace(",", "."))
-
 
 def load_reference_txt(path: str) -> pd.DataFrame:
     with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
@@ -382,7 +445,8 @@ def load_reference_txt(path: str) -> pd.DataFrame:
         "(1) simple Patch/LAB_L/LAB_A/LAB_B table, "
         "(2) CGATS-like BEGIN_DATA_FORMAT / BEGIN_DATA with patch/sample and LAB columns."
     )
-    
+
+
 def normalize_reference_columns(df: pd.DataFrame, source_label: str) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(col).strip() for col in df.columns]
@@ -583,10 +647,7 @@ def pick_corners_gui(image_bgr: np.ndarray, window_name: str = "Pick corners") -
         shown = display.copy()
 
     points: List[Tuple[int, int]] = []
-    instructions = (
-        "Click corners in order: TL, TR, BR, BL. "
-        "Press Enter to confirm, Backspace to undo, Esc to cancel."
-    )
+    instructions = "Click corners in order: TL, TR, BR, BL. Press Enter to confirm, Backspace to undo, Esc to cancel."
 
     def redraw() -> np.ndarray:
         canvas = shown.copy()
@@ -642,7 +703,6 @@ def pick_corners_gui(image_bgr: np.ndarray, window_name: str = "Pick corners") -
     cv2.destroyWindow(window_name)
     return [(x / scale, y / scale) for x, y in points]
 
-
 def rectified_size_from_grid(rectified_width: int, grid_cols: int, grid_rows: int) -> Tuple[int, int]:
     cell = rectified_width / grid_cols
     rectified_height = int(round(cell * grid_rows))
@@ -658,10 +718,7 @@ def rectify_chart(
 ) -> Tuple[np.ndarray, np.ndarray]:
     dst_w, dst_h = rectified_size_from_grid(rectified_width, grid_cols, grid_rows)
     src = np.array(corners_xy, dtype=np.float32)
-    dst = np.array(
-        [[0, 0], [dst_w - 1, 0], [dst_w - 1, dst_h - 1], [0, dst_h - 1]],
-        dtype=np.float32,
-    )
+    dst = np.array([[0, 0], [dst_w - 1, 0], [dst_w - 1, dst_h - 1], [0, dst_h - 1]], dtype=np.float32)
     H = cv2.getPerspectiveTransform(src, dst)
     rectified = cv2.warpPerspective(image_bgr, H, (dst_w, dst_h), flags=cv2.INTER_CUBIC)
     return rectified, H
@@ -741,17 +798,23 @@ def image_file_to_data_uri(path: str) -> str:
     with open(path, "rb") as f:
         encoded = base64.b64encode(f.read()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
-    
-def delta_e_2000_sl1(
+
+
+def delta_e_2000_custom(
     lab1: Tuple[float, float, float],
     lab2: Tuple[float, float, float],
+    *,
+    force_sl1: bool = False,
+    ignore_luminance: bool = False,
+    kL: float = 1.0,
     kC: float = 1.0,
     kH: float = 1.0,
 ) -> float:
     """
-    CIEDE2000 variant with S_L forced to 1, as required by Metamorfoze.
+    Generic CIEDE2000 implementation with two Metamorfoze-related options:
+    - force_sl1=True     -> CIE2000SL=1
+    - ignore_luminance=True -> CIE2000 without luminance = ΔE(ab)*
     """
-
     L1, a1, b1 = [float(v) for v in lab1]
     L2, a2, b2 = [float(v) for v in lab2]
 
@@ -777,7 +840,7 @@ def delta_e_2000_sl1(
     h1p = hp_fun(a1p, b1)
     h2p = hp_fun(a2p, b2)
 
-    dLp = L2 - L1
+    dLp = 0.0 if ignore_luminance else (L2 - L1)
     dCp = C2p - C1p
 
     if C1p * C2p == 0:
@@ -791,6 +854,7 @@ def delta_e_2000_sl1(
 
     dHp = 2.0 * np.sqrt(C1p * C2p) * np.sin(np.radians(dhp) / 2.0)
 
+    Lp_bar = 0.5 * (L1 + L2)
     Cp_bar = 0.5 * (C1p + C2p)
 
     if C1p * C2p == 0:
@@ -815,36 +879,41 @@ def delta_e_2000_sl1(
 
     delta_theta = 30.0 * np.exp(-((hp_bar - 275.0) / 25.0) ** 2)
     Rc = 2.0 * np.sqrt((Cp_bar ** 7) / (Cp_bar ** 7 + 25.0 ** 7)) if Cp_bar > 0 else 0.0
+    Rt = -np.sin(np.radians(2.0 * delta_theta)) * Rc
 
-    S_L = 1.0
-    S_C = 1.0 + 0.045 * Cp_bar
-    S_H = 1.0 + 0.015 * Cp_bar * T
-    R_T = -np.sin(np.radians(2.0 * delta_theta)) * Rc
+    if force_sl1:
+        Sl = 1.0
+    else:
+        Sl = 1.0 + (0.015 * (Lp_bar - 50.0) ** 2) / np.sqrt(20.0 + (Lp_bar - 50.0) ** 2)
 
-    term_L = dLp / S_L
-    term_C = dCp / (kC * S_C)
-    term_H = dHp / (kH * S_H)
+    Sc = 1.0 + 0.045 * Cp_bar
+    Sh = 1.0 + 0.015 * Cp_bar * T
+
+    term_L = 0.0 if ignore_luminance else (dLp / (kL * Sl))
+    term_C = dCp / (kC * Sc)
+    term_H = dHp / (kH * Sh)
 
     delta_e = np.sqrt(
         term_L * term_L
         + term_C * term_C
         + term_H * term_H
-        + R_T * term_C * term_H
+        + Rt * term_C * term_H
     )
     return float(delta_e)
 
 
-def compute_delta_e(
+def delta_e_ab_metamorfoze(
     lab_ref: Tuple[float, float, float],
     lab_meas: Tuple[float, float, float],
-    method: str,
 ) -> float:
-    method = str(method).lower()
-    if method == "cie2000":
-        return float(colour.delta_E(np.array(lab_ref), np.array(lab_meas), method="CIE 2000"))
-    if method == "metamorfoze-sl1":
-        return delta_e_2000_sl1(lab_ref, lab_meas)
-    raise ValueError(f"Unsupported deltaE method: {method}")
+    return delta_e_2000_custom(lab_ref, lab_meas, ignore_luminance=True)
+
+
+def delta_e_sl1_metamorfoze(
+    lab_ref: Tuple[float, float, float],
+    lab_meas: Tuple[float, float, float],
+) -> float:
+    return delta_e_2000_custom(lab_ref, lab_meas, force_sl1=True)
 
 
 def compute_measurements(
@@ -855,7 +924,6 @@ def compute_measurements(
     patch_fill: float,
     rgb_to_lab_transform: ImageCms.ImageCmsTransform,
     neutral_chroma_threshold: float,
-    deltae_method: str,
 ) -> List[PatchMeasurement]:
     results: List[PatchMeasurement] = []
     for ref in references:
@@ -870,10 +938,15 @@ def compute_measurements(
         rgb = sample_roi_rgb_mean(rectified_bgr, roi)
         lab_meas = rgb_triplet_to_lab(rgb, rgb_to_lab_transform)
         lab_ref = (ref.L, ref.a, ref.b)
-        de = compute_delta_e(lab_ref, lab_meas, deltae_method)
+
+        de_cie2000 = float(colour.delta_E(np.array(lab_ref), np.array(lab_meas), method="CIE 2000"))
+        de_sl1 = delta_e_sl1_metamorfoze(lab_ref, lab_meas)
+        de_ab = delta_e_ab_metamorfoze(lab_ref, lab_meas)
+
         dL = float(lab_meas[0] - lab_ref[0])
         da = float(lab_meas[1] - lab_ref[1])
         db = float(lab_meas[2] - lab_ref[2])
+
         chroma = reference_chroma(lab_ref)
         is_neutral = chroma <= neutral_chroma_threshold
 
@@ -885,7 +958,9 @@ def compute_measurements(
                 rgb_mean_8bit=rgb,
                 lab_measured=lab_meas,
                 lab_reference=lab_ref,
-                delta_e_00=de,
+                delta_e_cie2000=de_cie2000,
+                delta_e_sl1=de_sl1,
+                delta_e_ab=de_ab,
                 delta_L=dL,
                 delta_a=da,
                 delta_b=db,
@@ -897,42 +972,28 @@ def compute_measurements(
     return results
 
 
-def evaluate_metamorfoze(mean_de: float, max_de: float, level: str) -> Dict[str, Optional[bool]]:
-    level = level.lower()
-    result: Dict[str, Optional[bool]] = {
-        "level": level,
-        "mean_limit": None,
-        "max_limit": None,
-        "mean_pass": None,
-        "max_pass": None,
-        "overall_pass": None,
-    }
+def filter_metamorfoze_neutrals(
+    measurements: Sequence[PatchMeasurement],
+    level: str,
+) -> List[PatchMeasurement]:
+    if level not in METAMORFOZE_SPECS or level == "none":
+        return [m for m in measurements if m.is_neutral_reference]
 
-    if level == "full":
-        result["mean_limit"] = 3.0
-        result["max_limit"] = 7.0
-    elif level == "light":
-        result["mean_limit"] = 4.0
-        result["max_limit"] = 14.0
-    elif level in ("extra-light", "none"):
-        return result
-    else:
-        raise ValueError(f"Unknown Metamorfoze level: {level}")
-
-    result["mean_pass"] = mean_de <= float(result["mean_limit"])
-    result["max_pass"] = max_de <= float(result["max_limit"])
-    result["overall_pass"] = bool(result["mean_pass"] and result["max_pass"])
-    return result
+    floor = float(METAMORFOZE_SPECS[level]["neutral_lstar_floor"])
+    return [
+        m for m in measurements
+        if m.is_neutral_reference and m.lab_reference[0] >= floor
+    ]
 
 
-def summarize_neutral_scale(measurements: Sequence[PatchMeasurement]) -> Dict[str, object]:
-    neutrals = [m for m in measurements if m.is_neutral_reference]
+def summarize_neutral_scale(measurements: Sequence[PatchMeasurement], level: str = "none") -> Dict[str, object]:
+    neutrals = filter_metamorfoze_neutrals(measurements, level)
     if not neutrals:
         return {
             "patch_count": 0,
             "patches": [],
-            "mean_deltaE00": None,
-            "max_deltaE00": None,
+            "mean_deltaEab": None,
+            "max_deltaEab": None,
             "mean_abs_deltaL": None,
             "max_abs_deltaL": None,
             "mean_abs_deltaa": None,
@@ -941,7 +1002,7 @@ def summarize_neutral_scale(measurements: Sequence[PatchMeasurement]) -> Dict[st
             "max_abs_deltab": None,
         }
 
-    dE = np.array([m.delta_e_00 for m in neutrals], dtype=float)
+    dEab = np.array([m.delta_e_ab for m in neutrals], dtype=float)
     dL = np.array([m.delta_L for m in neutrals], dtype=float)
     da = np.array([m.delta_a for m in neutrals], dtype=float)
     db = np.array([m.delta_b for m in neutrals], dtype=float)
@@ -949,8 +1010,8 @@ def summarize_neutral_scale(measurements: Sequence[PatchMeasurement]) -> Dict[st
     return {
         "patch_count": len(neutrals),
         "patches": [m.patch for m in neutrals],
-        "mean_deltaE00": float(np.mean(dE)),
-        "max_deltaE00": float(np.max(dE)),
+        "mean_deltaEab": float(np.mean(dEab)),
+        "max_deltaEab": float(np.max(dEab)),
         "mean_abs_deltaL": float(np.mean(np.abs(dL))),
         "max_abs_deltaL": float(np.max(np.abs(dL))),
         "mean_abs_deltaa": float(np.mean(np.abs(da))),
@@ -960,26 +1021,289 @@ def summarize_neutral_scale(measurements: Sequence[PatchMeasurement]) -> Dict[st
     }
 
 
+def evaluate_white_balance(
+    measurements: Sequence[PatchMeasurement],
+    level: str,
+) -> Dict[str, object]:
+    if level == "none":
+        return {"applicable": False}
+
+    specs = METAMORFOZE_SPECS[level]
+    limit = float(specs["white_balance_limit"])
+    neutrals = filter_metamorfoze_neutrals(measurements, level)
+
+    per_patch = [{"patch": m.patch, "deltaEab": m.delta_e_ab, "pass": m.delta_e_ab <= limit} for m in neutrals]
+    values = [m.delta_e_ab for m in neutrals]
+
+    return {
+        "applicable": True,
+        "formula": "CIE2000 without luminance",
+        "unit": "ΔE(ab)*",
+        "neutral_lstar_floor": specs["neutral_lstar_floor"],
+        "patch_count": len(neutrals),
+        "limit": limit,
+        "mean": float(np.mean(values)) if values else None,
+        "max": float(np.max(values)) if values else None,
+        "all_patches_pass": bool(all(v <= limit for v in values)) if values else None,
+        "per_patch": per_patch,
+    }
+
+
+def evaluate_exposure(
+    measurements: Sequence[PatchMeasurement],
+    level: str,
+) -> Dict[str, object]:
+    if level == "none":
+        return {"applicable": False}
+
+    specs = METAMORFOZE_SPECS[level]
+    limit = float(specs["exposure_limit"])
+    neutrals = filter_metamorfoze_neutrals(measurements, level)
+
+    per_patch = [{"patch": m.patch, "deltaL": m.delta_L, "abs_deltaL": abs(m.delta_L), "pass": abs(m.delta_L) <= limit} for m in neutrals]
+    values = [abs(m.delta_L) for m in neutrals]
+
+    highlight_patch = None
+    if neutrals:
+        highlight_patch = min(neutrals, key=lambda m: abs(m.lab_reference[0] - 95.0))
+
+    return {
+        "applicable": True,
+        "formula": "CIE2000SL=1 (ΔL*)",
+        "unit": "ΔL*",
+        "neutral_lstar_floor": specs["neutral_lstar_floor"],
+        "patch_count": len(neutrals),
+        "limit": limit,
+        "mean_abs": float(np.mean(values)) if values else None,
+        "max_abs": float(np.max(values)) if values else None,
+        "all_patches_pass": bool(all(v <= limit for v in values)) if values else None,
+        "highlight_patch": None if highlight_patch is None else {
+            "patch": highlight_patch.patch,
+            "L_ref": highlight_patch.lab_reference[0],
+            "L_meas": highlight_patch.lab_measured[0],
+            "deltaL": highlight_patch.delta_L,
+            "abs_deltaL": abs(highlight_patch.delta_L),
+            "pass": abs(highlight_patch.delta_L) <= limit,
+        },
+        "per_patch": per_patch,
+    }
+
+
+def build_gain_pairs(neutrals: Sequence[PatchMeasurement]) -> List[GainPair]:
+    ordered = sorted(neutrals, key=lambda m: m.lab_reference[0], reverse=True)
+
+    pairs: List[GainPair] = []
+    for i in range(len(ordered) - 1):
+        hi = ordered[i]
+        lo = ordered[i + 1]
+        ref_diff = hi.lab_reference[0] - lo.lab_reference[0]
+        if ref_diff <= 0:
+            continue
+        if not (7.0 <= ref_diff <= 13.0):
+            continue
+
+        meas_diff = hi.lab_measured[0] - lo.lab_measured[0]
+        gain_percent = 100.0 * meas_diff / ref_diff
+
+        bucket = "other"
+        if abs(hi.lab_reference[0] - 95.0) <= 3.0 and abs(lo.lab_reference[0] - 85.0) <= 3.0:
+            bucket = "highlights"
+
+        pairs.append(
+            GainPair(
+                patch_hi=hi.patch,
+                patch_lo=lo.patch,
+                L_ref_hi=hi.lab_reference[0],
+                L_ref_lo=lo.lab_reference[0],
+                L_meas_hi=hi.lab_measured[0],
+                L_meas_lo=lo.lab_measured[0],
+                ref_diff=ref_diff,
+                meas_diff=meas_diff,
+                gain_percent=gain_percent,
+                bucket=bucket,
+            )
+        )
+    return pairs
+
+
+def evaluate_gain_modulation(
+    measurements: Sequence[PatchMeasurement],
+    level: str,
+) -> Dict[str, object]:
+    if level == "none":
+        return {"applicable": False}
+
+    specs = METAMORFOZE_SPECS[level]
+    neutrals = filter_metamorfoze_neutrals(measurements, level)
+    pairs = build_gain_pairs(neutrals)
+
+    hi_min = float(specs["gain_highlights_min"])
+    hi_max = float(specs["gain_highlights_max"])
+    other_min = float(specs["gain_other_min"])
+    other_max = float(specs["gain_other_max"])
+
+    hi_pairs = [p for p in pairs if p.bucket == "highlights"]
+    other_pairs = [p for p in pairs if p.bucket == "other"]
+
+    def serialize_pair(p: GainPair) -> Dict[str, object]:
+        limit_min = hi_min if p.bucket == "highlights" else other_min
+        limit_max = hi_max if p.bucket == "highlights" else other_max
+        return {
+            "patch_hi": p.patch_hi,
+            "patch_lo": p.patch_lo,
+            "L_ref_hi": p.L_ref_hi,
+            "L_ref_lo": p.L_ref_lo,
+            "L_meas_hi": p.L_meas_hi,
+            "L_meas_lo": p.L_meas_lo,
+            "ref_diff": p.ref_diff,
+            "meas_diff": p.meas_diff,
+            "gain_percent": p.gain_percent,
+            "bucket": p.bucket,
+            "pass": limit_min <= p.gain_percent <= limit_max,
+        }
+
+    return {
+        "applicable": True,
+        "formula": "CIE2000SL=1-based ΔL* step comparison",
+        "unit": "percent",
+        "note": "Approximation for CCSG neutrals; preferred targets for gain modulation are UTT / linear gray scales.",
+        "highlight_limits": [hi_min, hi_max],
+        "other_limits": [other_min, other_max],
+        "highlight_pairs_count": len(hi_pairs),
+        "other_pairs_count": len(other_pairs),
+        "highlights_all_pass": bool(all(hi_min <= p.gain_percent <= hi_max for p in hi_pairs)) if hi_pairs else None,
+        "other_all_pass": bool(all(other_min <= p.gain_percent <= other_max for p in other_pairs)) if other_pairs else None,
+        "pairs": [serialize_pair(p) for p in pairs],
+    }
+
+
+def evaluate_color_accuracy(
+    measurements: Sequence[PatchMeasurement],
+    level: str,
+) -> Dict[str, object]:
+    if level == "none":
+        return {"applicable": False}
+
+    specs = METAMORFOZE_SPECS[level]
+    mean_limit = specs.get("color_mean_limit")
+    max_limit = specs.get("color_max_limit")
+
+    values = np.array([m.delta_e_sl1 for m in measurements], dtype=float)
+    mean_value = float(np.mean(values)) if len(values) else None
+    max_value = float(np.max(values)) if len(values) else None
+
+    if mean_limit is None or max_limit is None:
+        return {
+            "applicable": False,
+            "formula": "CIE2000SL=1",
+            "unit": "ΔE*",
+            "note": "Metamorfoze Extra Light does not specify a technical color accuracy tolerance; only visual primary-color plausibility is required.",
+            "mean": mean_value,
+            "max": max_value,
+        }
+
+    return {
+        "applicable": True,
+        "formula": "CIE2000SL=1",
+        "unit": "ΔE*",
+        "mean": mean_value,
+        "max": max_value,
+        "mean_limit": float(mean_limit),
+        "max_limit": float(max_limit),
+        "mean_pass": bool(mean_value <= float(mean_limit)) if mean_value is not None else None,
+        "max_pass": bool(max_value <= float(max_limit)) if max_value is not None else None,
+        "overall_pass": bool((mean_value <= float(mean_limit)) and (max_value <= float(max_limit))) if mean_value is not None and max_value is not None else None,
+        "worst_patches": [
+            {"patch": m.patch, "deltaE_sl1": m.delta_e_sl1}
+            for m in sorted(measurements, key=lambda m: m.delta_e_sl1, reverse=True)[:15]
+        ],
+    }
+
+
+def evaluate_metamorfoze(
+    measurements: Sequence[PatchMeasurement],
+    level: str,
+) -> Dict[str, object]:
+    if level == "none":
+        return {"level": "none", "applicable": False}
+
+    wb = evaluate_white_balance(measurements, level)
+    exposure = evaluate_exposure(measurements, level)
+    gain = evaluate_gain_modulation(measurements, level)
+    color = evaluate_color_accuracy(measurements, level)
+
+    overall_flags: List[bool] = []
+
+    for section in (wb, exposure):
+        if section.get("applicable") and section.get("all_patches_pass") is not None:
+            overall_flags.append(bool(section["all_patches_pass"]))
+
+    if gain.get("applicable"):
+        if gain.get("highlights_all_pass") is not None:
+            overall_flags.append(bool(gain["highlights_all_pass"]))
+        if gain.get("other_all_pass") is not None:
+            overall_flags.append(bool(gain["other_all_pass"]))
+
+    if color.get("applicable") and color.get("overall_pass") is not None:
+        overall_flags.append(bool(color["overall_pass"]))
+
+    return {
+        "level": level,
+        "applicable": True,
+        "white_balance": wb,
+        "exposure": exposure,
+        "gain_modulation": gain,
+        "color_accuracy": color,
+        "overall_pass": bool(all(overall_flags)) if overall_flags else None,
+        "limitations": [
+            "This evaluation is based on a single centre-position CCSG capture.",
+            "Whole-image-plane white balance / illumination require additional targets or frame-filling white sheets.",
+            "Gain modulation on CCSG neutrals is approximate; UTT or linear gray scales are preferable.",
+        ],
+    }
+
 def save_rectified_with_rois(
     rectified_bgr: np.ndarray,
     measurements: Sequence[PatchMeasurement],
     output_path: str,
 ) -> None:
     vis = rectified_bgr.copy()
+
     for m in measurements:
         x, y, w, h = m.roi_rectified_xywh
+
+        # ROI rectangle
         cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 255), 2)
-        label = f"{m.patch} {m.delta_e_00:.2f}"
+
+        # Short label: patch + main metric only
+        # Prefer color accuracy in overlay, because it is the main per-patch chart diagnostic.
+        label = f"{m.patch} {m.delta_e_sl1:.2f}"
+
+        # Put label inside the patch near the top-left corner
+        tx = x + 4
+        ty = y + 16
+
+        # Small white background for readability
+        (text_w, text_h), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1
+        )
+        bg_x0 = max(0, tx - 2)
+        bg_y0 = max(0, ty - text_h - 2)
+        bg_x1 = min(vis.shape[1], tx + text_w + 2)
+        bg_y1 = min(vis.shape[0], ty + baseline + 2)
+
+        cv2.rectangle(vis, (bg_x0, bg_y0), (bg_x1, bg_y1), (255, 255, 255), -1)
         cv2.putText(
             vis,
             label,
-            (x + 4, y + 18),
+            (tx, ty),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            0.42,
             (0, 0, 255),
             1,
             cv2.LINE_AA,
         )
+
     cv2.imwrite(output_path, vis)
 
 
@@ -1040,9 +1364,14 @@ def save_heatmap_from_values(
     plt.close(fig)
 
 
-def save_delta_e_heatmap(measurements: Sequence[PatchMeasurement], grid_rows: int, grid_cols: int, output_path: str) -> None:
-    arr, labels = measurement_grid(measurements, grid_rows, grid_cols, lambda m: m.delta_e_00)
-    save_heatmap_from_values(arr, labels, grid_rows, grid_cols, "ΔE00 heatmap", "ΔE00", output_path)
+def save_delta_sl1_heatmap(measurements: Sequence[PatchMeasurement], grid_rows: int, grid_cols: int, output_path: str) -> None:
+    arr, labels = measurement_grid(measurements, grid_rows, grid_cols, lambda m: m.delta_e_sl1)
+    save_heatmap_from_values(arr, labels, grid_rows, grid_cols, "ΔE* heatmap (CIE2000SL=1)", "ΔE*", output_path)
+
+
+def save_delta_ab_heatmap(measurements: Sequence[PatchMeasurement], grid_rows: int, grid_cols: int, output_path: str) -> None:
+    arr, labels = measurement_grid(measurements, grid_rows, grid_cols, lambda m: m.delta_e_ab)
+    save_heatmap_from_values(arr, labels, grid_rows, grid_cols, "ΔE(ab)* heatmap (white balance)", "ΔE(ab)*", output_path)
 
 
 def save_delta_component_heatmap(
@@ -1060,7 +1389,8 @@ def save_delta_component_heatmap(
     getter, title, label = mapping[component_name]
     arr, labels = measurement_grid(measurements, grid_rows, grid_cols, getter)
     save_heatmap_from_values(arr, labels, grid_rows, grid_cols, title, label, output_path, cmap="coolwarm")
-    
+
+
 def get_rgb_colourspace_by_name(name: str):
     aliases = {
         "eciRGBv2": ["ECI RGB v2", "eciRGB v2", "eciRGBv2"],
@@ -1096,11 +1426,7 @@ def save_colourspace_chromaticity_plot(
     ax.scatter(reference_xy[:, 0], reference_xy[:, 1], s=28, marker="o", label="Reference patches")
     ax.scatter(measured_xy[:, 0], measured_xy[:, 1], s=28, marker="x", label="Measured patches")
 
-    for cs, label in [
-        (srgb, "sRGB"),
-        (eci, "eciRGB v2"),
-        (adobe, "Adobe RGB (1998)"),
-    ]:
+    for cs, label in [(srgb, "sRGB"), (eci, "eciRGB v2"), (adobe, "Adobe RGB (1998)")]:
         primaries = np.asarray(cs.primaries, dtype=float)
         triangle = np.vstack([primaries, primaries[0]])
         ax.plot(triangle[:, 0], triangle[:, 1], linewidth=2, label=label)
@@ -1118,14 +1444,14 @@ def save_colourspace_chromaticity_plot(
 
 
 def save_top_patches_chart(measurements: Sequence[PatchMeasurement], output_path: str, top_n: int = 15) -> None:
-    ordered = sorted(measurements, key=lambda m: m.delta_e_00, reverse=True)[:top_n]
+    ordered = sorted(measurements, key=lambda m: m.delta_e_sl1, reverse=True)[:top_n]
     labels = [m.patch for m in ordered][::-1]
-    values = [m.delta_e_00 for m in ordered][::-1]
+    values = [m.delta_e_sl1 for m in ordered][::-1]
 
     fig, ax = plt.subplots(figsize=(10, max(6, len(labels) * 0.35 + 2)))
     ax.barh(labels, values)
-    ax.set_title(f"Top {len(labels)} worst patches by ΔE00")
-    ax.set_xlabel("ΔE00")
+    ax.set_title(f"Top {len(labels)} worst patches by ΔE* (SL=1)")
+    ax.set_xlabel("ΔE*")
     ax.set_ylabel("Patch")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
@@ -1154,7 +1480,7 @@ def save_lstar_scatter(measurements: Sequence[PatchMeasurement], output_path: st
 
 
 def save_neutral_scale_plot(measurements: Sequence[PatchMeasurement], output_path: str) -> None:
-    neutrals = sorted([m for m in measurements if m.is_neutral_reference], key=lambda m: (m.row, m.col))
+    neutrals = sorted([m for m in measurements if m.is_neutral_reference], key=lambda m: m.lab_reference[0], reverse=True)
     if not neutrals:
         fig, ax = plt.subplots(figsize=(6, 4))
         ax.text(0.5, 0.5, "No neutral patches detected", ha="center", va="center")
@@ -1168,14 +1494,12 @@ def save_neutral_scale_plot(measurements: Sequence[PatchMeasurement], output_pat
     labels = [m.patch for m in neutrals]
     L_ref = [m.lab_reference[0] for m in neutrals]
     L_meas = [m.lab_measured[0] for m in neutrals]
-    a_meas = [m.lab_measured[1] for m in neutrals]
-    b_meas = [m.lab_measured[2] for m in neutrals]
+    wb = [m.delta_e_ab for m in neutrals]
 
     fig, ax = plt.subplots(figsize=(max(8, len(neutrals) * 0.7), 6))
     ax.plot(x, L_ref, marker="o", label="L* reference")
     ax.plot(x, L_meas, marker="o", label="L* measured")
-    ax.plot(x, a_meas, marker="x", label="a* measured")
-    ax.plot(x, b_meas, marker="x", label="b* measured")
+    ax.plot(x, wb, marker="x", label="ΔE(ab)*")
     ax.set_title("Neutral scale summary")
     ax.set_xlabel("Neutral patch")
     ax.set_ylabel("Value")
@@ -1235,9 +1559,11 @@ def write_measurements_csv(measurements: Sequence[PatchMeasurement], output_path
                 "deltaL": m.delta_L,
                 "deltaa": m.delta_a,
                 "deltab": m.delta_b,
+                "deltaE_cie2000": m.delta_e_cie2000,
+                "deltaE_sl1": m.delta_e_sl1,
+                "deltaEab": m.delta_e_ab,
                 "reference_chroma": m.reference_chroma,
                 "is_neutral_reference": m.is_neutral_reference,
-                "deltaE00": m.delta_e_00,
                 "roi_x": m.roi_rectified_xywh[0],
                 "roi_y": m.roi_rectified_xywh[1],
                 "roi_w": m.roi_rectified_xywh[2],
@@ -1253,121 +1579,27 @@ def write_summary_json(
     reference_path: str,
     profile_name: str,
     measurements: Sequence[PatchMeasurement],
-    metamorfoze_eval: Dict[str, Optional[bool]],
+    metamorfoze_eval: Dict[str, object],
     neutral_summary: Dict[str, object],
     corners_xy: Sequence[Tuple[float, float]],
-    deltae_method: str,
 ) -> None:
-    delta_e_values = [m.delta_e_00 for m in measurements]
     summary = {
+        "script_version": SCRIPT_VERSION,
         "image": str(Path(image_path).resolve()),
         "reference": str(Path(reference_path).resolve()),
         "profile_used": profile_name,
-        "deltae_method": deltae_method,
-        "generated_plots": {
-            "heatmap": "deltae_heatmap.png",
-            "deltaL_heatmap": "deltaL_heatmap.png",
-            "deltaa_heatmap": "deltaa_heatmap.png",
-            "deltab_heatmap": "deltab_heatmap.png",
-            "top_patches": "top_patches.png",
-            "lstar_scatter": "lstar_scatter.png",
-            "neutral_scale_plot": "neutral_scale_plot.png",
-            "colourspace_chromaticity": "colourspace_chromaticity.png",
-            "measured_rgb_bars": "measured_rgb_bars.png",
-            "html_report": "report.html",
-        },
         "patch_count": len(measurements),
-        "mean_deltaE00": float(np.mean(delta_e_values)) if delta_e_values else None,
-        "max_deltaE00": float(np.max(delta_e_values)) if delta_e_values else None,
+        "mean_deltaE_cie2000": float(np.mean([m.delta_e_cie2000 for m in measurements])) if measurements else None,
+        "mean_deltaE_sl1": float(np.mean([m.delta_e_sl1 for m in measurements])) if measurements else None,
+        "max_deltaE_sl1": float(np.max([m.delta_e_sl1 for m in measurements])) if measurements else None,
+        "mean_deltaEab_neutrals_info": neutral_summary.get("mean_deltaEab"),
+        "max_deltaEab_neutrals_info": neutral_summary.get("max_deltaEab"),
         "metamorfoze": metamorfoze_eval,
         "neutral_scale": neutral_summary,
         "corners_xy": [[float(x), float(y)] for x, y in corners_xy],
-        "worst_patches": [
-            {"patch": m.patch, "deltaE00": m.delta_e_00}
-            for m in sorted(measurements, key=lambda m: m.delta_e_00, reverse=True)[:10]
-        ],
     }
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
-
-
-def report_strings() -> Dict[str, Dict[str, str]]:
-    return {
-        "cze": {
-            "title": "DeltaE2000 report",
-            "lang_label": "Jazyk",
-            "summary": "Souhrn",
-            "inputs": "Vstupy",
-            "image": "Obraz",
-            "reference": "Reference",
-            "profile": "Použitý profil",
-            "patch_count": "Počet polí",
-            "mean_de": "Průměrná ΔE00",
-            "max_de": "Maximální ΔE00",
-            "deltae_method": "Metoda ΔE",
-            "metamorfoze": "Metamorfoze",
-            "plots": "Grafy",
-            "legend": "Legenda patchů",
-            "worst": "Nejhorší pole",
-            "patch": "Patch",
-            "deltae": "ΔE00",
-            "deltaL": "ΔL*",
-            "deltaa": "Δa*",
-            "deltab": "Δb*",
-            "ref_swatch": "Reference",
-            "meas_swatch": "Měření",
-            "lab_ref": "Lab reference",
-            "lab_meas": "Lab měření",
-            "rgb_meas": "RGB měření",
-            "overlay_desc": "Narovnaný target s vyznačenými měřicími oblastmi. Slouží ke kontrole, že segmentace sedí na správná pole a měří se střed patchů.",
-            "de_heatmap_desc": "Celková barevná odchylka po jednotlivých polích. Nízké hodnoty znamenají dobrou shodu s referencí, vyšší hodnoty ukazují problémová pole nebo systematickou chybu.",
-            "dl_heatmap_desc": "Rozdíl světlosti vůči referenci. Kladné hodnoty znamenají světlejší výsledek, záporné tmavší.",
-            "da_heatmap_desc": "Posun na ose zelená–červená. Kladné hodnoty znamenají posun do červena, záporné do zelena.",
-            "db_heatmap_desc": "Posun na ose modrá–žlutá. Kladné hodnoty znamenají posun do žluta, záporné do modra.",
-            "top_desc": "Přehled polí s nejvyšší ΔE00. Užitečné pro rychlou identifikaci nejproblematičtějších patchů.",
-            "lstar_desc": "Porovnání referenční a naměřené světlosti. Body blízko diagonály znamenají dobrou shodu tonalit.",
-            "neutral_desc": "Samostatné vyhodnocení neutrálních polí odvozených z referenční tabulky. Pomáhá rychle zkontrolovat tonalitu, neutralitu a případný barevný nádech šedé škály.",
-            "chroma_desc": "Rozložení referenčních a naměřených barev v rovině x,y vůči gamutům sRGB, eciRGB v2 a Adobe RGB (1998). Slouží orientačně, ne jako náhrada ΔE.",
-            "rgb_desc": "Naměřené RGB hodnoty všech patchů. Pomáhá odhalit clipping, nerovnováhu kanálů nebo nečekané trendy.",
-        },
-        "eng": {
-            "title": "DeltaE2000 report",
-            "lang_label": "Language",
-            "summary": "Summary",
-            "inputs": "Inputs",
-            "image": "Image",
-            "reference": "Reference",
-            "profile": "Profile used",
-            "patch_count": "Patch count",
-            "mean_de": "Mean ΔE00",
-            "max_de": "Max ΔE00",
-            "deltae_method": "ΔE method",
-            "metamorfoze": "Metamorfoze",
-            "plots": "Plots",
-            "legend": "Patch legend",
-            "worst": "Worst patches",
-            "patch": "Patch",
-            "deltae": "ΔE00",
-            "deltaL": "ΔL*",
-            "deltaa": "Δa*",
-            "deltab": "Δb*",
-            "ref_swatch": "Reference",
-            "meas_swatch": "Measured",
-            "lab_ref": "Reference Lab",
-            "lab_meas": "Measured Lab",
-            "rgb_meas": "Measured RGB",
-            "overlay_desc": "Rectified target with sampling ROIs. Useful for confirming that segmentation is aligned with the intended patch centers.",
-            "de_heatmap_desc": "Overall color difference per patch. Low values indicate good agreement with the reference, while higher values highlight problematic patches or systematic drift.",
-            "dl_heatmap_desc": "Lightness difference relative to the reference. Positive values mean lighter output, negative values darker.",
-            "da_heatmap_desc": "Shift on the green–red axis. Positive values indicate a red shift, negative values a green shift.",
-            "db_heatmap_desc": "Shift on the blue–yellow axis. Positive values indicate a yellow shift, negative values a blue shift.",
-            "top_desc": "Patches with the highest ΔE00 values. Useful for quickly identifying the most problematic areas.",
-            "lstar_desc": "Reference versus measured lightness. Points near the diagonal indicate good tonal agreement.",
-            "neutral_desc": "Separate evaluation of neutral patches derived from the reference table. Useful for quickly checking tonality, neutrality, and possible color cast in the gray scale.",
-            "chroma_desc": "Reference and measured chromaticities in the x,y plane relative to the sRGB, eciRGB v2 and Adobe RGB (1998) gamuts. This is an orientation aid, not a substitute for ΔE.",
-            "rgb_desc": "Measured RGB values for all patches. Useful for detecting clipping, channel imbalance, or unexpected trends.",
-        },
-    }
 
 
 def write_html_report(
@@ -1376,18 +1608,15 @@ def write_html_report(
     reference_path: str,
     profile_name: str,
     measurements: Sequence[PatchMeasurement],
-    metamorfoze_eval: Dict[str, Optional[bool]],
-    neutral_summary: Dict[str, object],
+    metamorfoze_eval: Dict[str, object],
     plot_paths: Dict[str, str],
-    deltae_method: str,
 ) -> None:
-    strings = report_strings()
-    s_cz = strings["cze"]
-    s_en = strings["eng"]
+    mean_sl1 = float(np.mean([m.delta_e_sl1 for m in measurements])) if measurements else float("nan")
+    max_sl1 = float(np.max([m.delta_e_sl1 for m in measurements])) if measurements else float("nan")
+    mean_cie2000 = float(np.mean([m.delta_e_cie2000 for m in measurements])) if measurements else float("nan")
+    mean_wb = float(np.mean([m.delta_e_ab for m in measurements])) if measurements else float("nan")
 
-    mean_de = float(np.mean([m.delta_e_00 for m in measurements])) if measurements else float("nan")
-    max_de = float(np.max([m.delta_e_00 for m in measurements])) if measurements else float("nan")
-    worst_measurements = sorted(measurements, key=lambda m: m.delta_e_00, reverse=True)[:15]
+    worst_measurements = sorted(measurements, key=lambda m: m.delta_e_sl1, reverse=True)[:15]
 
     def plot_section(plot_key: str, title: str, desc_cz: str, desc_en: str) -> str:
         if plot_key not in plot_paths or not Path(plot_paths[plot_key]).exists():
@@ -1405,7 +1634,12 @@ def write_html_report(
     worst_rows = []
     for m in worst_measurements:
         worst_rows.append(
-            f"<tr><td>{html.escape(m.patch)}</td><td>{m.delta_e_00:.2f}</td><td>{m.delta_L:.2f}</td><td>{m.delta_a:.2f}</td><td>{m.delta_b:.2f}</td></tr>"
+            f"<tr>"
+            f"<td>{html.escape(m.patch)}</td>"
+            f"<td>{m.delta_e_sl1:.2f}</td>"
+            f"<td>{m.delta_e_ab:.2f}</td>"
+            f"<td>{m.delta_L:.2f}</td>"
+            f"</tr>"
         )
 
     legend_rows = []
@@ -1420,19 +1654,23 @@ def write_html_report(
             f"<td>{m.lab_reference[0]:.2f}, {m.lab_reference[1]:.2f}, {m.lab_reference[2]:.2f}</td>"
             f"<td>{m.lab_measured[0]:.2f}, {m.lab_measured[1]:.2f}, {m.lab_measured[2]:.2f}</td>"
             f"<td>{clamp_u8(m.rgb_mean_8bit[0])}, {clamp_u8(m.rgb_mean_8bit[1])}, {clamp_u8(m.rgb_mean_8bit[2])}</td>"
-            f"<td>{m.delta_e_00:.2f}</td>"
+            f"<td>{m.delta_e_sl1:.2f}</td>"
+            f"<td>{m.delta_e_ab:.2f}</td>"
+            f"<td>{m.delta_L:.2f}</td>"
             f"</tr>"
         )
 
-    metamorfoze_pretty = html.escape(json.dumps(metamorfoze_eval, ensure_ascii=False, indent=2))
-    neutral_pretty = html.escape(json.dumps(neutral_summary, ensure_ascii=False, indent=2))
+    wb = metamorfoze_eval.get("white_balance", {})
+    ex = metamorfoze_eval.get("exposure", {})
+    gm = metamorfoze_eval.get("gain_modulation", {})
+    ca = metamorfoze_eval.get("color_accuracy", {})
 
     html_text = f"""<!doctype html>
 <html lang="cs">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{html.escape(s_cz["title"])}</title>
+<title>Metamorfoze report</title>
 <style>
 body {{
   font-family: Arial, sans-serif;
@@ -1461,16 +1699,11 @@ h1, h2, h3 {{
   border-radius: 8px;
   padding: 12px;
 }}
-.plot-list {{
-  display: block;
-}}
 .plot-card {{
   border: 1px solid #ddd;
   border-radius: 8px;
   padding: 12px;
   margin-bottom: 24px;
-  width: 100%;
-  box-sizing: border-box;
 }}
 .plot-card img {{
   display: block;
@@ -1489,11 +1722,6 @@ th, td {{
   padding: 6px 8px;
   text-align: left;
   vertical-align: top;
-}}
-pre {{
-  background: #f7f7f7;
-  padding: 10px;
-  overflow-x: auto;
 }}
 .swatch {{
   display: inline-block;
@@ -1518,6 +1746,14 @@ body[data-lang="cze"] .lang-cze {{
 body[data-lang="cze"] .lang-eng {{
   display: none;
 }}
+.metric-pass {{
+  color: #0a7f2e;
+  font-weight: bold;
+}}
+.metric-fail {{
+  color: #b00020;
+  font-weight: bold;
+}}
 </style>
 <script>
 function setLang(lang) {{
@@ -1526,74 +1762,99 @@ function setLang(lang) {{
 </script>
 </head>
 <body data-lang="cze">
+
 <div class="controls">
-  <label for="lang-switch" class="lang-cze">{html.escape(s_cz["lang_label"])}:</label>
-  <label for="lang-switch" class="lang-eng">{html.escape(s_en["lang_label"])}:</label>
+  <label for="lang-switch" class="lang-cze">Jazyk:</label>
+  <label for="lang-switch" class="lang-eng">Language:</label>
   <select id="lang-switch" onchange="setLang(this.value)">
     <option value="cze">CZE</option>
     <option value="eng">ENG</option>
   </select>
 </div>
 
-<h1 class="lang-cze">{html.escape(s_cz["title"])}</h1>
-<h1 class="lang-eng">{html.escape(s_en["title"])}</h1>
+<h1 class="lang-cze">Metamorfoze / DeltaE report</h1>
+<h1 class="lang-eng">Metamorfoze / DeltaE report</h1>
 
 <div class="summary-grid">
   <div class="card">
-    <h2 class="lang-cze">{html.escape(s_cz["inputs"])}</h2>
-    <h2 class="lang-eng">{html.escape(s_en["inputs"])}</h2>
-    <p><strong class="lang-cze">{html.escape(s_cz["image"])}:</strong><strong class="lang-eng">{html.escape(s_en["image"])}:</strong> {html.escape(str(image_path))}</p>
-    <p><strong class="lang-cze">{html.escape(s_cz["reference"])}:</strong><strong class="lang-eng">{html.escape(s_en["reference"])}:</strong> {html.escape(str(reference_path))}</p>
-    <p><strong class="lang-cze">{html.escape(s_cz["profile"])}:</strong><strong class="lang-eng">{html.escape(s_en["profile"])}:</strong> {html.escape(profile_name)}</p>
+    <h2 class="lang-cze">Vstupy</h2>
+    <h2 class="lang-eng">Inputs</h2>
+    <p><strong>Image:</strong> {html.escape(str(image_path))}</p>
+    <p><strong>Reference:</strong> {html.escape(str(reference_path))}</p>
+    <p><strong>Profile used:</strong> {html.escape(profile_name)}</p>
+    <p><strong>Patch count:</strong> {len(measurements)}</p>
   </div>
 
   <div class="card">
-    <h2 class="lang-cze">{html.escape(s_cz["summary"])}</h2>
-    <h2 class="lang-eng">{html.escape(s_en["summary"])}</h2>
-    <p><strong class="lang-cze">{html.escape(s_cz["patch_count"])}:</strong><strong class="lang-eng">{html.escape(s_en["patch_count"])}:</strong> {len(measurements)}</p>
-    <p><strong class="lang-cze">{html.escape(s_cz["mean_de"])}:</strong><strong class="lang-eng">{html.escape(s_en["mean_de"])}:</strong> {mean_de:.3f}</p>
-    <p><strong class="lang-cze">{html.escape(s_cz["max_de"])}:</strong><strong class="lang-eng">{html.escape(s_en["max_de"])}:</strong> {max_de:.3f}</p>
-    <p><strong class="lang-cze">{html.escape(s_cz["deltae_method"])}:</strong><strong class="lang-eng">{html.escape(s_en["deltae_method"])}:</strong> {html.escape(deltae_method)}</p>
+    <h2 class="lang-cze">Souhrn</h2>
+    <h2 class="lang-eng">Summary</h2>
+    <p><strong>Mean ΔE00:</strong> {mean_cie2000:.3f}</p>
+    <p><strong>Mean ΔE* (SL=1):</strong> {mean_sl1:.3f}</p>
+    <p><strong>Max ΔE* (SL=1):</strong> {max_sl1:.3f}</p>
+    <p><strong>Mean ΔE(ab)*:</strong> {mean_wb:.3f}</p>
+    <p><strong>Overall pass:</strong> {metamorfoze_eval.get("overall_pass")}</p>
   </div>
 
   <div class="card">
-    <h2 class="lang-cze">{html.escape(s_cz["metamorfoze"])}</h2>
-    <h2 class="lang-eng">{html.escape(s_en["metamorfoze"])}</h2>
-    <pre>{metamorfoze_pretty}</pre>
+    <h2>White balance</h2>
+    <p><strong>Formula:</strong> {html.escape(str(wb.get("formula", "")))}</p>
+    <p><strong>Limit:</strong> {wb.get("limit", "-")}</p>
+    <p><strong>Mean:</strong> {wb.get("mean", "-")}</p>
+    <p><strong>Max:</strong> {wb.get("max", "-")}</p>
+    <p><strong>Pass:</strong> {wb.get("all_patches_pass", "-")}</p>
   </div>
 
   <div class="card">
-    <h2>Neutral scale</h2>
-    <pre>{neutral_pretty}</pre>
+    <h2>Exposure / Tone reproduction</h2>
+    <p><strong>Limit:</strong> {ex.get("limit", "-")}</p>
+    <p><strong>Mean |ΔL*|:</strong> {ex.get("mean_abs", "-")}</p>
+    <p><strong>Max |ΔL*|:</strong> {ex.get("max_abs", "-")}</p>
+    <p><strong>Pass:</strong> {ex.get("all_patches_pass", "-")}</p>
+  </div>
+
+  <div class="card">
+    <h2>Gain modulation</h2>
+    <p><strong>Highlights:</strong> {gm.get("highlight_limits", "-")}</p>
+    <p><strong>Other:</strong> {gm.get("other_limits", "-")}</p>
+    <p><strong>Highlights pass:</strong> {gm.get("highlights_all_pass", "-")}</p>
+    <p><strong>Other pass:</strong> {gm.get("other_all_pass", "-")}</p>
+  </div>
+
+  <div class="card">
+    <h2>Color accuracy</h2>
+    <p><strong>Formula:</strong> {html.escape(str(ca.get("formula", "")))}</p>
+    <p><strong>Mean:</strong> {ca.get("mean", "-")}</p>
+    <p><strong>Max:</strong> {ca.get("max", "-")}</p>
+    <p><strong>Mean limit:</strong> {ca.get("mean_limit", "-")}</p>
+    <p><strong>Max limit:</strong> {ca.get("max_limit", "-")}</p>
+    <p><strong>Pass:</strong> {ca.get("overall_pass", "-")}</p>
   </div>
 </div>
 
-<h2 class="lang-cze">{html.escape(s_cz["plots"])}</h2>
-<h2 class="lang-eng">{html.escape(s_en["plots"])}</h2>
+<h2 class="lang-cze">Grafy</h2>
+<h2 class="lang-eng">Plots</h2>
 
-<div class="plot-list">
-  {plot_section("overlay", "Overlay", s_cz["overlay_desc"], s_en["overlay_desc"])}
-  {plot_section("deltae_heatmap", "ΔE00 heatmap", s_cz["de_heatmap_desc"], s_en["de_heatmap_desc"])}
-  {plot_section("deltaL_heatmap", "ΔL* heatmap", s_cz["dl_heatmap_desc"], s_en["dl_heatmap_desc"])}
-  {plot_section("deltaa_heatmap", "Δa* heatmap", s_cz["da_heatmap_desc"], s_en["da_heatmap_desc"])}
-  {plot_section("deltab_heatmap", "Δb* heatmap", s_cz["db_heatmap_desc"], s_en["db_heatmap_desc"])}
-  {plot_section("top_patches", "Top patches", s_cz["top_desc"], s_en["top_desc"])}
-  {plot_section("lstar_scatter", "L* scatter", s_cz["lstar_desc"], s_en["lstar_desc"])}
-  {plot_section("neutral_scale_plot", "Neutral scale", s_cz["neutral_desc"], s_en["neutral_desc"])}
-  {plot_section("colourspace_chromaticity", "Chromaticity", s_cz["chroma_desc"], s_en["chroma_desc"])}
-  {plot_section("measured_rgb_bars", "Measured RGB bars", s_cz["rgb_desc"], s_en["rgb_desc"])}
-</div>
+{plot_section("overlay", "Overlay", "Narovnaný target s ROI a stručnými popisky patchů.", "Rectified target with ROIs and short patch labels.")}
+{plot_section("delta_sl1_heatmap", "ΔE* heatmap (SL=1)", "Mapa barevné odchylky pro color accuracy.", "Color-accuracy heatmap.")}
+{plot_section("delta_ab_heatmap", "ΔE(ab)* heatmap", "Mapa white balance bez luminance.", "White-balance heatmap without luminance.")}
+{plot_section("deltaL_heatmap", "ΔL* heatmap", "Mapa rozdílu světlosti.", "Lightness-difference heatmap.")}
+{plot_section("deltaa_heatmap", "Δa* heatmap", "Posun na ose zelená–červená.", "Shift on green–red axis.")}
+{plot_section("deltab_heatmap", "Δb* heatmap", "Posun na ose modrá–žlutá.", "Shift on blue–yellow axis.")}
+{plot_section("top_patches", "Top patches", "Nejhorší patchy podle ΔE* (SL=1).", "Worst patches by ΔE* (SL=1).")}
+{plot_section("lstar_scatter", "L* scatter", "Porovnání referenční a naměřené L*.", "Reference vs measured L*.")}
+{plot_section("neutral_scale_plot", "Neutral scale", "Souhrn neutrální škály.", "Neutral-scale summary.")}
+{plot_section("colourspace_chromaticity", "Chromaticity", "Chromatičnost vůči pracovním RGB prostorům.", "Chromaticity against working RGB spaces.")}
+{plot_section("measured_rgb_bars", "Measured RGB bars", "Naměřené RGB hodnoty všech patchů.", "Measured RGB values for all patches.")}
 
-<h2 class="lang-cze">{html.escape(s_cz["worst"])}</h2>
-<h2 class="lang-eng">{html.escape(s_en["worst"])}</h2>
+<h2 class="lang-cze">Nejhorší patchy</h2>
+<h2 class="lang-eng">Worst patches</h2>
 <table>
 <thead>
 <tr>
-  <th>{html.escape(s_cz["patch"])}</th>
-  <th>{html.escape(s_cz["deltae"])}</th>
-  <th>{html.escape(s_cz["deltaL"])}</th>
-  <th>{html.escape(s_cz["deltaa"])}</th>
-  <th>{html.escape(s_cz["deltab"])}</th>
+  <th>Patch</th>
+  <th>ΔE* (SL=1)</th>
+  <th>ΔE(ab)*</th>
+  <th>ΔL*</th>
 </tr>
 </thead>
 <tbody>
@@ -1601,18 +1862,20 @@ function setLang(lang) {{
 </tbody>
 </table>
 
-<h2 class="lang-cze">{html.escape(s_cz["legend"])}</h2>
-<h2 class="lang-eng">{html.escape(s_en["legend"])}</h2>
+<h2 class="lang-cze">Legenda patchů</h2>
+<h2 class="lang-eng">Patch legend</h2>
 <table>
 <thead>
 <tr>
-  <th>{html.escape(s_cz["patch"])}</th>
-  <th>{html.escape(s_cz["ref_swatch"])}</th>
-  <th>{html.escape(s_cz["meas_swatch"])}</th>
-  <th>{html.escape(s_cz["lab_ref"])}</th>
-  <th>{html.escape(s_cz["lab_meas"])}</th>
-  <th>{html.escape(s_cz["rgb_meas"])}</th>
-  <th>{html.escape(s_cz["deltae"])}</th>
+  <th>Patch</th>
+  <th>Reference</th>
+  <th>Measured</th>
+  <th>Reference Lab</th>
+  <th>Measured Lab</th>
+  <th>Measured RGB</th>
+  <th>ΔE* (SL=1)</th>
+  <th>ΔE(ab)*</th>
+  <th>ΔL*</th>
 </tr>
 </thead>
 <tbody>
@@ -1667,18 +1930,15 @@ def run_pipeline(args: argparse.Namespace) -> int:
         patch_fill=args.patch_fill,
         rgb_to_lab_transform=rgb_to_lab_transform,
         neutral_chroma_threshold=args.neutral_chroma_threshold,
-        deltae_method=args.deltae_method,
     )
 
-    delta_e_values = np.array([m.delta_e_00 for m in measurements], dtype=float)
-    mean_de = float(np.mean(delta_e_values))
-    max_de = float(np.max(delta_e_values))
-    metamorfoze_eval = evaluate_metamorfoze(mean_de, max_de, args.metamorfoze_level)
-    neutral_summary = summarize_neutral_scale(measurements)
+    neutral_summary = summarize_neutral_scale(measurements, args.metamorfoze_level)
+    metamorfoze_eval = evaluate_metamorfoze(measurements, args.metamorfoze_level)
 
     rectified_path = output_dir / "rectified.png"
     overlay_path = output_dir / "overlay.png"
-    heatmap_path = output_dir / "deltae_heatmap.png"
+    delta_sl1_heatmap_path = output_dir / "deltaE_sl1_heatmap.png"
+    delta_ab_heatmap_path = output_dir / "deltaE_ab_heatmap.png"
     deltaL_path = output_dir / "deltaL_heatmap.png"
     deltaa_path = output_dir / "deltaa_heatmap.png"
     deltab_path = output_dir / "deltab_heatmap.png"
@@ -1693,17 +1953,20 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     cv2.imwrite(str(rectified_path), rectified_bgr)
     save_rectified_with_rois(rectified_bgr, measurements, str(overlay_path))
-    save_delta_e_heatmap(measurements, args.grid_rows, args.grid_cols, str(heatmap_path))
+    save_delta_sl1_heatmap(measurements, args.grid_rows, args.grid_cols, str(delta_sl1_heatmap_path))
+    save_delta_ab_heatmap(measurements, args.grid_rows, args.grid_cols, str(delta_ab_heatmap_path))
     save_delta_component_heatmap(measurements, args.grid_rows, args.grid_cols, "deltaL", str(deltaL_path))
     save_delta_component_heatmap(measurements, args.grid_rows, args.grid_cols, "deltaa", str(deltaa_path))
     save_delta_component_heatmap(measurements, args.grid_rows, args.grid_cols, "deltab", str(deltab_path))
     save_top_patches_chart(measurements, str(top_path))
     save_lstar_scatter(measurements, str(lstar_path))
     save_neutral_scale_plot(measurements, str(neutral_plot_path))
+
     if not args.skip_colourspace_plot:
         save_colourspace_chromaticity_plot(measurements, str(chromaticity_path))
     if not args.skip_rgb_bars_plot:
         save_measured_rgb_bars(measurements, str(rgb_bars_path))
+
     write_measurements_csv(measurements, str(csv_path))
     write_summary_json(
         str(json_path),
@@ -1714,12 +1977,12 @@ def run_pipeline(args: argparse.Namespace) -> int:
         metamorfoze_eval,
         neutral_summary,
         corners_xy,
-        args.deltae_method,
     )
 
     plot_paths = {
         "overlay": str(overlay_path),
-        "deltae_heatmap": str(heatmap_path),
+        "delta_sl1_heatmap": str(delta_sl1_heatmap_path),
+        "delta_ab_heatmap": str(delta_ab_heatmap_path),
         "deltaL_heatmap": str(deltaL_path),
         "deltaa_heatmap": str(deltaa_path),
         "deltab_heatmap": str(deltab_path),
@@ -1740,48 +2003,71 @@ def run_pipeline(args: argparse.Namespace) -> int:
             profile_name,
             measurements,
             metamorfoze_eval,
-            neutral_summary,
             plot_paths,
-            args.deltae_method,
         )
 
     print(f"Image:           {args.image}")
     print(f"Reference:       {args.reference}")
     print(f"Profile used:    {profile_name}")
-    print(f"Delta E method:  {args.deltae_method}")
     print(f"Patch count:     {len(measurements)}")
-    print(f"Mean ΔE00:       {mean_de:.3f}")
-    print(f"Max  ΔE00:       {max_de:.3f}")
+    print(f"Mean ΔE00:       {np.mean([m.delta_e_cie2000 for m in measurements]):.3f}")
+    print(f"Mean ΔE* SL=1:   {np.mean([m.delta_e_sl1 for m in measurements]):.3f}")
+    print(f"Max  ΔE* SL=1:   {np.max([m.delta_e_sl1 for m in measurements]):.3f}")
     print(f"Neutral patches: {neutral_summary['patch_count']}")
 
-    if metamorfoze_eval["overall_pass"] is not None:
-        print(
-            "Metamorfoze:     "
-            f"{metamorfoze_eval['level']} | "
-            f"mean<= {metamorfoze_eval['mean_limit']} => {metamorfoze_eval['mean_pass']} | "
-            f"max<= {metamorfoze_eval['max_limit']} => {metamorfoze_eval['max_pass']} | "
-            f"overall => {metamorfoze_eval['overall_pass']}"
-        )
+    if args.metamorfoze_level != "none":
+        print(f"Metamorfoze level: {args.metamorfoze_level}")
+        wb = metamorfoze_eval["white_balance"]
+        ex = metamorfoze_eval["exposure"]
+        gm = metamorfoze_eval["gain_modulation"]
+        ca = metamorfoze_eval["color_accuracy"]
+
+        if wb.get("applicable"):
+            print(
+                f"  White balance ΔE(ab)*: max={wb['max']:.3f} "
+                f"limit={wb['limit']} overall={wb['all_patches_pass']}"
+            )
+        if ex.get("applicable"):
+            print(
+                f"  Exposure ΔL*: max_abs={ex['max_abs']:.3f} "
+                f"limit={ex['limit']} overall={ex['all_patches_pass']}"
+            )
+        if gm.get("applicable"):
+            print(
+                f"  Gain modulation: highlights={gm['highlights_all_pass']} "
+                f"other={gm['other_all_pass']}"
+            )
+        if ca.get("applicable"):
+            print(
+                f"  Color accuracy ΔE*: mean={ca['mean']:.3f}<= {ca['mean_limit']} => {ca['mean_pass']} | "
+                f"max={ca['max']:.3f}<= {ca['max_limit']} => {ca['max_pass']} | "
+                f"overall => {ca['overall_pass']}"
+            )
+        else:
+            print(f"  Color accuracy: not technically specified for {args.metamorfoze_level}")
+
+        print(f"  Overall pass:   {metamorfoze_eval['overall_pass']}")
 
     print("\nOutputs:")
     for path in [
         rectified_path,
         overlay_path,
-        heatmap_path,
+        delta_sl1_heatmap_path,
+        delta_ab_heatmap_path,
         deltaL_path,
         deltaa_path,
         deltab_path,
         top_path,
         lstar_path,
         neutral_plot_path,
+        csv_path,
+        json_path,
     ]:
         print(f"  {path}")
     if not args.skip_colourspace_plot:
         print(f"  {chromaticity_path}")
     if not args.skip_rgb_bars_plot:
         print(f"  {rgb_bars_path}")
-    print(f"  {csv_path}")
-    print(f"  {json_path}")
     if not args.skip_html_report:
         print(f"  {html_path}")
 
@@ -1789,8 +2075,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
 
 def run_self_tests() -> int:
-    import tempfile
-
     def assert_true(condition: bool, message: str) -> None:
         if not condition:
             raise AssertionError(message)
@@ -1802,111 +2086,25 @@ def run_self_tests() -> int:
     def test_parse_float_maybe_comma() -> None:
         assert_true(abs(parse_float_maybe_comma("96,25") - 96.25) < 1e-9, "Comma parsing failed")
 
-    def test_reference_chroma_neutral_detection() -> None:
-        lab = (50.0, 1.0, 2.0)
-        chroma = reference_chroma(lab)
-        assert_true(abs(chroma - np.hypot(1.0, 2.0)) < 1e-9, "Chroma computation failed")
+    def test_delta_e_ab_ignores_lightness() -> None:
+        lab1 = (50.0, 0.0, 0.0)
+        lab2 = (60.0, 0.0, 0.0)
+        de = delta_e_ab_metamorfoze(lab1, lab2)
+        assert_true(abs(de) < 1e-9, "ΔE(ab)* should ignore pure lightness difference")
 
-    def test_normalize_reference_columns_european_excel_style() -> None:
-        df = pd.DataFrame([
-            {"Unnamed: 0": "A1", "L*": "96,2985", "a*": "-0,5458", "b*": "1,5096"},
-            {"Unnamed: 0": "B10", "L*": "49,3193", "a*": "-0,3254", "b*": "0,3267"},
-        ])
-        normalized = normalize_reference_columns(df, "reference.xlsx")
-        assert_true(list(normalized.columns) == ["patch", "L", "a", "b", "row", "col"], "Unexpected columns")
-        assert_true(int(normalized.iloc[1]["row"]) == 9 and int(normalized.iloc[1]["col"]) == 1, "Unexpected B10 position")
-
-    def test_decode_pillow_lab_pixel_signed_ab() -> None:
-        pixel = np.array([245, 0, 3], dtype=np.uint8)
-        L, a, b = decode_pillow_lab_pixel(pixel)
-        assert_true(a == 0.0 and b == 3.0, "Signed LAB decoding failed")
-        assert_true(L > 90.0, "Unexpected L decoding")
-
-    def test_load_reference_csv() -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            csv_path = Path(tmpdir) / "ref.csv"
-            pd.DataFrame([
-                {"patch": "A1", "L": 50, "a": 0, "b": 0, "row": 0, "col": 0},
-                {"patch": "A2", "L": 60, "a": 1, "b": 2, "row": 0, "col": 1},
-            ]).to_csv(csv_path, index=False)
-            refs = load_reference_table(str(csv_path))
-            assert_true(len(refs) == 2, "Failed to load CSV reference")
-
-    def test_load_reference_txt_simple() -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            txt_path = Path(tmpdir) / "ref_simple.txt"
-            txt_path.write_text(
-                "Patch\tLAB_L\tLAB_A\tLAB_B\n"
-                "A1\t96.55\t-0.91\t0.57\n"
-                "B10\t49.69\t-0.20\t0.01\n"
-                "\n"
-                "The data in this file is reported in CIE L* a* b* data\n",
-                encoding="utf-8",
-            )
-            refs = load_reference_table(str(txt_path))
-            assert_true(len(refs) == 2, f"Expected 2 references from simple txt, got {len(refs)}")
-            assert_true(refs[0].patch == "A1", f"Unexpected first simple txt patch: {refs[0].patch}")
-            assert_true(refs[1].row == 9 and refs[1].col == 1, f"Unexpected B10 position: {refs[1].row}, {refs[1].col}")
-
-    def test_load_reference_txt_cgats_minimal() -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            txt_path = Path(tmpdir) / "ref_cgats.txt"
-            txt_path.write_text(
-                "NUMBER_OF_FIELDS 4\n"
-                "BEGIN_DATA_FORMAT\n"
-                "Sample_NAME   Lab_L   Lab_a   Lab_b\n"
-                "END_DATA_FORMAT\n"
-                "NUMBER_OF_SETS 2\n"
-                "BEGIN_DATA\n"
-                "A1 95.81 -0.11 2.34\n"
-                "B10 50.28 -0.19 1.43\n"
-                "END_DATA\n",
-                encoding="utf-8",
-            )
-            refs = load_reference_table(str(txt_path))
-            assert_true(len(refs) == 2, f"Expected 2 references from CGATS txt, got {len(refs)}")
-            assert_true(refs[0].patch == "A1", f"Unexpected first CGATS txt patch: {refs[0].patch}")
-            assert_true(refs[1].row == 9 and refs[1].col == 1, f"Unexpected B10 CGATS position: {refs[1].row}, {refs[1].col}")
-
-    def test_load_reference_txt_cgats_extended() -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            txt_path = Path(tmpdir) / "ref_cgats_extended.txt"
-            txt_path.write_text(
-                "NUMBER_OF_FIELDS 11\n"
-                "BEGIN_DATA_FORMAT\n"
-                "SampleID SAMPLE_NAME RGB_R RGB_G RGB_B XYZ_X XYZ_Y XYZ_Z LAB_L LAB_A LAB_B\n"
-                "END_DATA_FORMAT\n"
-                "NUMBER_OF_SETS 2\n"
-                "BEGIN_DATA\n"
-                "1 A1 242.81 244.08 241.52 86.28 89.54 71.21 95.81 -0.11 2.34\n"
-                "2 B10 110.59 110.69 110.39 17.95 18.65 14.82 50.28 -0.19 1.43\n"
-                "END_DATA\n",
-                encoding="utf-8",
-            )
-            refs = load_reference_table(str(txt_path))
-            assert_true(len(refs) == 2, f"Expected 2 references from extended CGATS txt, got {len(refs)}")
-            assert_true(refs[0].patch == "A1", f"Unexpected first extended CGATS txt patch: {refs[0].patch}")
-            assert_true(refs[1].row == 9 and refs[1].col == 1, f"Unexpected B10 extended CGATS position: {refs[1].row}, {refs[1].col}")
-
-    def test_delta_e_sl1_differs_from_standard() -> None:
+    def test_delta_e_sl1_and_standard_differ() -> None:
         lab1 = (50.0, 2.0, 3.0)
         lab2 = (55.0, 4.0, 1.0)
-        de_std = compute_delta_e(lab1, lab2, "cie2000")
-        de_sl1 = compute_delta_e(lab1, lab2, "metamorfoze-sl1")
+        de_std = float(colour.delta_E(np.array(lab1), np.array(lab2), method="CIE 2000"))
+        de_sl1 = delta_e_sl1_metamorfoze(lab1, lab2)
         assert_true(np.isfinite(de_std) and np.isfinite(de_sl1), "Delta E values must be finite")
-        assert_true(abs(de_std - de_sl1) > 1e-9, "SL=1 variant should differ from standard CIEDE2000 for this sample")
+        assert_true(abs(de_std - de_sl1) > 1e-9, "SL=1 variant should differ from standard CIEDE2000")
 
     tests = [
         test_patch_name_to_row_col,
         test_parse_float_maybe_comma,
-        test_reference_chroma_neutral_detection,
-        test_normalize_reference_columns_european_excel_style,
-        test_decode_pillow_lab_pixel_signed_ab,
-        test_load_reference_csv,
-        test_load_reference_txt_simple,
-        test_load_reference_txt_cgats_minimal,
-        test_load_reference_txt_cgats_extended,
-        test_delta_e_sl1_differs_from_standard,
+        test_delta_e_ab_ignores_lightness,
+        test_delta_e_sl1_and_standard_differ,
     ]
 
     failures = []
@@ -1937,7 +2135,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         stderr_write(
             "\nTip: add --image, --reference and --output-dir.\n"
             "Example:\n"
-            "  python deltae2000.py --image sample.tif --reference ref.csv --output-dir out --icc eciRGB_v2.icc"
+            "  python deltae_metamorfoze.py --image sample.tif --reference ref.csv --output-dir out --icc eciRGB_v2.icc --metamorfoze-level full"
         )
         return 0
 
