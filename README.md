@@ -340,7 +340,7 @@ The script supports the following Metamorfoze-oriented checks from a single CCSG
 ### Interactive mode
 
 ```bash
-python deltae_metamorfoze.py \
+python deltae2000.py \
   --image "ColorChecker SG.tif" \
   --reference "Profile_ColorCheckerSG_6.xlsx" \
   --output-dir out \
@@ -350,7 +350,7 @@ python deltae_metamorfoze.py \
 ### TXT reference input
 
 ```bash
-python deltae_metamorfoze.py \
+python deltae2000.py \
   --image "ColorChecker SG.tif" \
   --reference "x-rite_ColorCheckerSG-0716_LAB_61025-1508.txt" \
   --output-dir out
@@ -359,7 +359,7 @@ python deltae_metamorfoze.py \
 ### Non-interactive mode with explicit corners
 
 ```bash
-python deltae_metamorfoze.py \
+python deltae2000.py \
   --image "ColorChecker SG.tif" \
   --reference "Profile_ColorCheckerSG_6.xlsx" \
   --output-dir out \
@@ -370,7 +370,7 @@ python deltae_metamorfoze.py \
 ### Metamorfoze Full evaluation
 
 ```bash
-python deltae_metamorfoze.py \
+python deltae2000.py \
   --image "ColorChecker SG.tif" \
   --reference "Profile_ColorCheckerSG_6.xlsx" \
   --output-dir out \
@@ -380,7 +380,7 @@ python deltae_metamorfoze.py \
 ### Metamorfoze Light evaluation
 
 ```bash
-python deltae_metamorfoze.py \
+python deltae2000.py \
   --image "ColorChecker SG.tif" \
   --reference "Profile_ColorCheckerSG_6.xlsx" \
   --output-dir out \
@@ -390,7 +390,7 @@ python deltae_metamorfoze.py \
 ### Metamorfoze Extra-light evaluation
 
 ```bash
-python deltae_metamorfoze.py \
+python deltae2000.py \
   --image "ColorChecker SG.tif" \
   --reference "Profile_ColorCheckerSG_6.xlsx" \
   --output-dir out \
@@ -550,7 +550,7 @@ The current tests cover:
 
 ## Summary
 
-`deltae_metamorfoze.py` is a semi-automatic CCSG evaluation script that combines:
+`deltae2000.py` is a semi-automatic CCSG evaluation script that combines:
 
 * manual geometric selection
 * ICC-aware RGB-to-Lab conversion
