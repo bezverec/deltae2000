@@ -15,7 +15,7 @@ What this script does NOT fully evaluate:
 - File format / metadata compliance
 - MTF / sharpening / geometric distortion / noise across repeated captures
 
-Author: Jan Houserek + revised Metamorfoze logic
+Author: Jan Houserek
 License: GPLv3
 """
 
@@ -48,8 +48,8 @@ except Exception as exc:  # pragma: no cover
     ) from exc
 
 
-APP_TITLE = "DeltaE2000 v0.0.3"
-SCRIPT_VERSION = "2026-03-19-deltae2000-v0.0.3"
+APP_TITLE = "DeltaE2000 v0.0.4"
+SCRIPT_VERSION = "2026-03-19-deltae2000-v0.0.4"
 
 METAMORFOZE_SPECS: Dict[str, Dict[str, object]] = {
     "full": {
@@ -144,9 +144,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python deltae_metamorfoze.py --image sample.tif --reference ref.csv --output-dir out --icc eciRGB_v2.icc\n"
-            "  python deltae_metamorfoze.py --image sample.tif --reference ref.txt --output-dir out --metamorfoze-level full\n"
-            "  python deltae_metamorfoze.py --image sample.tif --reference ref.csv --output-dir out --corners 10 10 200 10 200 150 10 150 --no-gui\n"
+            "  python deltae2000.py --image sample.tif --reference ref.csv --output-dir out --icc eciRGB_v2.icc\n"
+            "  python deltae2000.py --image sample.tif --reference ref.txt --output-dir out --metamorfoze-level full\n"
+            "  python deltae2000.py --image sample.tif --reference ref.csv --output-dir out --corners 10 10 200 10 200 150 10 150 --no-gui\n"
         ),
     )
     parser.add_argument("--image", help="Input image path")
@@ -2135,7 +2135,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         stderr_write(
             "\nTip: add --image, --reference and --output-dir.\n"
             "Example:\n"
-            "  python deltae_metamorfoze.py --image sample.tif --reference ref.csv --output-dir out --icc eciRGB_v2.icc --metamorfoze-level full"
+            "  python deltae2000.py --image sample.tif --reference ref.csv --output-dir out --icc eciRGB_v2.icc --metamorfoze-level full"
         )
         return 0
 
